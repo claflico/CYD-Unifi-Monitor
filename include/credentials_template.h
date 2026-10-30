@@ -17,8 +17,9 @@
 // 4. Use the UniFi mobile app - it shows the controller IP
 #define UNIFI_HOST "192.168.1.1"      // Replace with YOUR UniFi Controller IP
 #define UNIFI_PORT 443                  // HTTPS port (keep as 443)
-#define UNIFI_USERNAME "your-local-user" // Your LOCAL UniFi username (NOT ui.com account!)
-#define UNIFI_PASSWORD "your-password"   // Your LOCAL UniFi password
+// UniFi API key - create one in UniFi Network under
+// Settings -> Control Plane -> Integrations -> Create API Key
+#define UNIFI_API_KEY "your-api-key"
 
 // Optional: Custom site name (keep as "default" for most users)
 #define UNIFI_SITE "default"

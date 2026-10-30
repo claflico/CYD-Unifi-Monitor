@@ -15,33 +15,31 @@ def read_credentials():
         content = f.read()
     return {
         'host': re.search(r'#define UNIFI_HOST "([^"]*)"', content).group(1),
-        'username': re.search(r'#define UNIFI_USERNAME "([^"]*)"', content).group(1),
-        'password': re.search(r'#define UNIFI_PASSWORD "([^"]*)"', content).group(1),
+        'api_key': re.search(r'#define UNIFI_API_KEY "([^"]*)"', content).group(1),
     }
 
 
 _creds = read_credentials()
 UNIFI_HOST = _creds['host']
-UNIFI_USERNAME = _creds['username']
-UNIFI_PASSWORD = _creds['password']
+UNIFI_API_KEY = _creds['api_key']
 BASE_URL = f"https://{UNIFI_HOST}"
 session = requests.Session()
 session.verify = False
+session.headers["X-API-KEY"] = UNIFI_API_KEY
 
 print("=== UniFi API Test ===")
 print(f"Host: {UNIFI_HOST}")
 
-# Login
-print("\n1. Login...")
-login_data = {"username": UNIFI_USERNAME, "password": UNIFI_PASSWORD, "remember": False}
-response = session.post(f"{BASE_URL}/api/auth/login", json=login_data)
+# Verify API key
+print("\n1. Checking API key...")
+response = session.get(f"{BASE_URL}/proxy/network/api/s/default/stat/sysinfo")
 print(f"   Status: {response.status_code}")
 
 if response.status_code != 200:
-    print(f"   Login failed: {response.text}")
+    print(f"   API key rejected: {response.text}")
     exit(1)
 
-print("   Login successful!")
+print("   API key accepted!")
 
 # Test endpoints
 endpoints = [

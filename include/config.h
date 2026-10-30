@@ -2,9 +2,16 @@
 #define CONFIG_H
 
 // Display Configuration
-#define SCREEN_WIDTH 320
-#define SCREEN_HEIGHT 480
-#define DISPLAY_ROTATION 0  // 0=portrait, 1=landscape
+#define SCREEN_WIDTH 480
+#define SCREEN_HEIGHT 320
+#define DISPLAY_ROTATION 1  // 1=landscape, 3=landscape rotated 180°
+
+// Touch Calibration
+// Set to 1, flash, tap the four corner arrows, then copy the printed values
+// into TOUCH_CAL_DATA and set back to 0. Recalibrate if DISPLAY_ROTATION changes.
+#define TOUCH_CALIBRATION_MODE 0
+// #define TOUCH_CAL_DATA { 300, 3600, 300, 3600, 1 }  // Placeholder until calibrated
+#define TOUCH_CAL_DATA { 305, 3583, 309, 3386, 7 }  // Placeholder until calibrated
 
 // Network Configuration
 #define WIFI_CONNECT_TIMEOUT 10000  // 10 seconds
@@ -14,6 +21,10 @@
 // Update Intervals (milliseconds)
 #define API_UPDATE_INTERVAL 5000    // Fetch new data every 5 seconds
 #define CHART_UPDATE_INTERVAL 1000  // Update chart every second
+#define USAGE_REPORT_INTERVAL 300000  // Refresh daily/monthly data usage every 5 minutes
+#define VPN_STATUS_INTERVAL 60000   // Refresh site-to-site VPN state every minute
+#define DEVICE_LIST_INTERVAL 60000  // Refresh the Devices tab every minute while it's open
+#define CLIENT_LIST_INTERVAL 30000  // Refresh the Clients tab every 30 seconds while it's open
 #define UI_REFRESH_RATE 20          // 50 FPS (1000/20)
 
 // Chart Configuration
@@ -51,6 +62,7 @@
 #define ENABLE_OTA 0                // Enable OTA updates
 #define ENABLE_WEB_CONFIG 0         // Enable web configuration portal
 #define ENABLE_SD_LOGGING 0         // Log data to SD card
+#define SHOW_VPN_STATUS 1           // Warn in the header when a UniFi VPN reports an error
 
 // Power Management
 #define ENABLE_AUTO_BRIGHTNESS 1    // Adjust based on time
@@ -60,12 +72,18 @@
 #define NIGHT_HOUR_END 6            // 6 AM
 
 // UniFi API Endpoints (UDM requires /proxy/network prefix)
-#define UNIFI_API_LOGIN "/api/auth/login"
+// Requests authenticate with the X-API-KEY header (UNIFI_API_KEY in credentials.h)
 #define UNIFI_API_HEALTH "/proxy/network/api/s/default/stat/health"
-#define UNIFI_API_SITES "/proxy/network/api/s/default/stat/sites"
-#define UNIFI_API_DEVICES "/proxy/network/api/s/default/stat/device"
-#define UNIFI_API_CLIENTS "/proxy/network/api/s/default/stat/sta"
 #define UNIFI_API_SYSINFO "/proxy/network/api/s/default/stat/sysinfo"
+#define UNIFI_API_DAILY "/proxy/network/api/s/default/stat/report/daily.site"
+#define UNIFI_API_MONTHLY "/proxy/network/api/s/default/stat/report/monthly.site"
+// stat/health's vpn summary misses IPsec tunnels, so VPN state comes from the v2 API
+#define UNIFI_API_VPN "/proxy/network/v2/api/site/default/vpn/connections"
+// ~110 KB for 17 devices, so it is stream-parsed and only fetched for the Devices tab
+#define UNIFI_API_DEVICES "/proxy/network/v2/api/site/default/device"
+// ~145 KB for 85 clients; unlike stat/sta it includes traffic rates for wired clients.
+// Its tx_bytes-r is the client's download and rx_bytes-r its upload (checked with a test download)
+#define UNIFI_API_CLIENTS "/proxy/network/v2/api/site/default/clients/active"
 
 // Error Messages
 #define MSG_WIFI_CONNECTING "Connecting to WiFi..."

@@ -3,8 +3,16 @@
 #include "config.h"
 #include "credentials.h"
 #include <HTTPClient.h>
+#include <StreamUtils.h>
 
-UniFiAPI::UniFiAPI() : authenticated(false), lastAuthTime(0) {
+// Set in credentials.h; default to skipping verification for UniFi's self-signed cert
+#ifndef UNIFI_SKIP_SSL_VERIFY
+#define UNIFI_SKIP_SSL_VERIFY true
+#endif
+
+UniFiAPI::UniFiAPI() : authenticated(false), lastAuthTime(0),
+                       dayUsage{0, 0, false}, monthUsage{0, 0, false}, lastUsageFetch(0),
+                       vpnDown(-1), lastVpnFetch(0) {
     #if UNIFI_SKIP_SSL_VERIFY
     client.setInsecure();
     #endif
@@ -14,10 +22,9 @@ UniFiAPI::~UniFiAPI() {
     disconnect();
 }
 
-bool UniFiAPI::connect(String url, String user, String pass) {
+bool UniFiAPI::connect(String url, String key) {
     baseUrl = url;
-    username = user;
-    password = pass;
+    apiKey = key;
     
     // Remove trailing slash if present
     if (baseUrl.endsWith("/")) {
@@ -27,904 +34,493 @@ bool UniFiAPI::connect(String url, String user, String pass) {
     return authenticate();
 }
 
+// Open a request with the API key attached
+bool UniFiAPI::beginRequest(HTTPClient& https, const String& url) {
+    if (!https.begin(client, url)) {
+        return false;
+    }
+    https.addHeader("X-API-KEY", apiKey);
+    https.addHeader("Accept", "application/json");
+    return true;
+}
+
+// API keys don't need a login; verify the key with a lightweight request
 bool UniFiAPI::authenticate() {
     HTTPClient https;
-    
-    String loginUrl = baseUrl + UNIFI_API_LOGIN;
+    lastAuthTime = millis();
     
     #if DEBUG_API
-    Serial.println("Authenticating with UniFi...");
-    Serial.println("URL: " + loginUrl);
+    Serial.println("Verifying UniFi API key...");
+    Serial.println("URL: " + baseUrl + UNIFI_API_SYSINFO);
     #endif
     
-    if (!https.begin(client, loginUrl)) {
+    if (!beginRequest(https, baseUrl + UNIFI_API_SYSINFO)) {
         Serial.println("Failed to begin HTTPS connection");
+        authenticated = false;
         return false;
     }
     
-    https.addHeader("Content-Type", "application/json");
-    const char* headerKeys[] = {"Set-Cookie", "X-Csrf-Token"};
-    https.collectHeaders(headerKeys, 2);
-    
-    // Create login JSON
-    JsonDocument doc;
-    doc["username"] = username;
-    doc["password"] = password;
-    doc["remember"] = false;
-    
-    String requestBody;
-    serializeJson(doc, requestBody);
+    int httpCode = https.GET();
+    authenticated = (httpCode == HTTP_CODE_OK);
     
     #if DEBUG_API
-    Serial.println("Login request: " + requestBody);
-    #endif
-    
-    int httpCode = https.POST(requestBody);
-    
-    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
-        String response = https.getString();
-        
-        // Extract cookies and CSRF token
-        if (https.hasHeader("Set-Cookie")) {
-            String cookies = https.header("Set-Cookie");
-            
-            // Extract TOKEN cookie for UDM
-            int tokenStart = cookies.indexOf("TOKEN=");
-            if (tokenStart != -1) {
-                int tokenEnd = cookies.indexOf(";", tokenStart);
-                if (tokenEnd == -1) tokenEnd = cookies.length();
-                sessionCookie = cookies.substring(tokenStart, tokenEnd);
-                
-                #if DEBUG_API
-                Serial.println("Got TOKEN cookie (first 60 chars): " + sessionCookie.substring(0, 60));
-                #endif
-            }
-        }
-        
-        // Extract CSRF token
-        if (https.hasHeader("X-Csrf-Token")) {
-            csrfToken = https.header("X-Csrf-Token");
-            #if DEBUG_API
-            Serial.println("Got CSRF token: " + csrfToken);
-            #endif
-        }
-        
-        // Parse response for CSRF token
-        JsonDocument responseDoc;
-        DeserializationError error = deserializeJson(responseDoc, response);
-        
-        if (!error) {
-            // Some UniFi versions return CSRF token in response
-            if (responseDoc["meta"]) {
-                csrfToken = responseDoc["meta"]["csrf_token"] | "";
-            }
-            
-            authenticated = true;
-            lastAuthTime = millis();
-            
-            #if DEBUG_API
-            Serial.println("Authentication successful");
-            #endif
-            
-            https.end();
-            return true;
-        }
+    if (authenticated) {
+        Serial.println("API key accepted");
+    } else {
+        Serial.printf("API key check failed. HTTP code: %d\n", httpCode);
     }
-    
-    #if DEBUG_API
-    Serial.printf("Authentication failed. HTTP code: %d\n", httpCode);
-    Serial.println("Response: " + https.getString());
     #endif
     
     https.end();
-    return false;
+    return authenticated;
 }
 
 bool UniFiAPI::isConnected() {
-    // Re-authenticate if session is older than 20 minutes
-    if (authenticated && (millis() - lastAuthTime > 1200000)) {
-        authenticated = authenticate();
+    // API keys don't expire, but retry the check if it failed (e.g. controller was down)
+    if (!authenticated && !apiKey.isEmpty() && (millis() - lastAuthTime > API_RETRY_DELAY)) {
+        authenticate();
     }
     return authenticated;
 }
 
 void UniFiAPI::disconnect() {
     authenticated = false;
-    sessionCookie = "";
-    csrfToken = "";
 }
 
 // Main function to get all network stats
 NetworkStats UniFiAPI::getNetworkStats() {
     NetworkStats stats = {0};
     stats.timestamp = millis();
-    stats.monthly_data_gb = 0;  // Initialize monthly data
     stats.data_source = "Data/Mo";  // Initialize data source label with default
     stats.connected_devices = 0;    // Explicitly initialize device count
     stats.uptime_percent = 0;       // Initialize uptime
-    stats.experience_score = 0;     // Initialize experience score
-    
+    stats.gateway_cpu = -1;         // -1 shows "--" until the gateway reports
+    stats.gateway_mem = -1;
+
     if (!isConnected()) {
         Serial.println("Not connected to UniFi");
         return stats;
     }
     
-    // ULTRA FAST - only bandwidth data for maximum touch responsiveness
-    Serial.println("\n=== Getting Network Stats (Bandwidth Only) ===");
+    Serial.println("\n=== Getting Network Stats ===");
 
-    // ONLY get device stats - has bandwidth + ping
-    getDeviceStats(stats); // Bandwidth, ping from WAN device only
-    Serial.println("After getDeviceStats: Monthly GB = " + String(stats.monthly_data_gb) + ", Source = " + stats.data_source);
+    // One small request for throughput, ping, uptime, gateway load and client counts
+    getHealthStats(stats);
 
-    // DISABLE device counting for touch responsiveness - will show monthly data instead
-    stats.connected_devices = 0; // Disable device count display
-    Serial.println("Device counting disabled - showing monthly data usage instead");
-
-    // Set reasonable defaults for other metrics
-    if (stats.experience_score == 0 || stats.experience_score > 99) {
-        // Calculate realistic experience from available metrics
-        float experience = 75.0; // Base score
-        if (stats.ping_ms > 0 && stats.ping_ms < 50) experience += 15;
-        else if (stats.ping_ms < 100) experience += 5;
-        if (stats.uptime_percent > 99) experience += 10;
-        stats.experience_score = experience;
-        Serial.println("Calculated experience: " + String(stats.experience_score) + "%");
+    // Usage totals change slowly, so refresh them on a longer interval
+    if (!dayUsage.valid || !monthUsage.valid || millis() - lastUsageFetch >= USAGE_REPORT_INTERVAL) {
+        lastUsageFetch = millis();
+        fetchUsageReport(UNIFI_API_DAILY, dayUsage);
+        fetchUsageReport(UNIFI_API_MONTHLY, monthUsage);
     }
+    stats.day_usage = dayUsage;
+    stats.month_usage = monthUsage;
 
-    Serial.println("Final data: Devices DISABLED, " + String(stats.uptime_percent) + "% uptime, " + String(stats.experience_score) + "% experience");
-    
-    // Calculate monthly data usage (convert from bytes to GB)
-    if (stats.total_bytes_month > 0) {
-        stats.monthly_data_gb = stats.total_bytes_month / (1024.0 * 1024.0 * 1024.0);
-    } else {
-        // Estimate based on current rate if no monthly data available
-        // Assuming 30 days average usage based on current throughput
-        float avgMbps = (stats.download_mbps + stats.upload_mbps) / 2.0;
-        if (avgMbps > 0) {
-            // Convert Mbps to GB per month (30 days)
-            stats.monthly_data_gb = (avgMbps * 30 * 24 * 3600) / (8.0 * 1024.0);
-        }
+    #if SHOW_VPN_STATUS
+    // Tunnel state rarely changes; a failed fetch also waits a full interval before retrying
+    if (lastVpnFetch == 0 || millis() - lastVpnFetch >= VPN_STATUS_INTERVAL) {
+        lastVpnFetch = millis();
+        fetchVpnStatus();
     }
+    #endif
+    stats.vpn_down = vpnDown;
+
+    Serial.println("Final data: " + String(stats.connected_devices) + " devices, " + String(stats.uptime_percent) + "% uptime, gateway CPU " + String(stats.gateway_cpu) + "% mem " + String(stats.gateway_mem) + "%");
     
     // Always show final stats
     Serial.printf("Final Stats: Down: %.2f Mbps, Up: %.2f Mbps, Devices: %d, Ping: %.1f\n",
                  stats.download_mbps, stats.upload_mbps, stats.connected_devices, stats.ping_ms);
-    Serial.printf("  Monthly: %.2f GB, Source: %s, Uptime: %.1f%%\n",
-                 stats.monthly_data_gb, stats.data_source.c_str(), stats.uptime_percent);
+    Serial.printf("  Today: %.1f/%.1f GB, Month: %.1f/%.1f GB (down/up), Uptime: %.1f%%\n",
+                 stats.day_usage.rx_bytes / 1e9, stats.day_usage.tx_bytes / 1e9,
+                 stats.month_usage.rx_bytes / 1e9, stats.month_usage.tx_bytes / 1e9,
+                 stats.uptime_percent);
     
     return stats;
 }
 
-// Get client statistics
-void UniFiAPI::getClientStats(NetworkStats& stats) {
+// Everything the dashboard shows each cycle comes from the ~2.5 KB health endpoint:
+// WAN throughput, latency, availability, gateway CPU/memory, and client counts
+void UniFiAPI::getHealthStats(NetworkStats& stats) {
     HTTPClient https;
-    // Use stat/sta endpoint for accurate connected device count
-    String clientsUrl = baseUrl + "/proxy/network/api/s/default/stat/sta";
+    String healthUrl = baseUrl + UNIFI_API_HEALTH;
     
-    #if DEBUG_API
-    Serial.println("Fetching client stats from: " + clientsUrl);
-    #endif
-    
-    if (!https.begin(client, clientsUrl)) {
-        Serial.println("Failed to begin HTTPS for clients");
+    if (!beginRequest(https, healthUrl)) {
+        Serial.println("Failed to begin HTTPS for health");
         return;
     }
     
-    // Always add authentication headers
-    if (!sessionCookie.isEmpty()) {
-        https.addHeader("Cookie", sessionCookie);
-    }
-    if (!csrfToken.isEmpty()) {
-        https.addHeader("X-Csrf-Token", csrfToken);
-    }
-    #if DEBUG_API
-    if (!sessionCookie.isEmpty()) {
-        Serial.println("Using auth cookie: " + sessionCookie.substring(0, 40) + "...");
-    }
-    #endif
-    
-    // ULTRA FAST timeout for touch responsiveness
-    https.setTimeout(1000);   // 1 second timeout - maximum responsiveness
-    
     int httpCode = https.GET();
-    
-    if (httpCode == HTTP_CODE_OK) {
-        // Get response size
-        int len = https.getSize();
-        Serial.println("Response size: " + String(len) + " bytes");
-        
-        // Get stream for reading chunks
-        WiFiClient* stream = https.getStreamPtr();
-        
-        int deviceCount = 0;
-        int wiredCount = 0; 
-        int wirelessCount = 0;
-        
-        // Process response in chunks to avoid stack overflow
-        const int chunkSize = 1024;  // Larger chunk for better performance
-        uint8_t* chunk = new uint8_t[chunkSize + 1];
-        String searchBuffer = "";
-        int totalBytesRead = 0;
-        
-        // Read entire response
-        while (stream->available()) {
-            int bytesRead = stream->readBytes(chunk, chunkSize);
-            totalBytesRead += bytesRead;
-            chunk[bytesRead] = '\0';
-            
-            // Add to search buffer
-            searchBuffer += String((char*)chunk);
-            
-            // Process every 4KB to prevent memory issues
-            if (searchBuffer.length() > 4096) {
-                // Count in this chunk but don't clear all - keep overlap
-                String processChunk = searchBuffer.substring(0, searchBuffer.length() - 200);
-                
-                int idx = 0;
-                while ((idx = processChunk.indexOf("\"mac\":\"", idx)) != -1) {
-                    deviceCount++;
-                    idx += 7;
-                }
-                
-                idx = 0;
-                while ((idx = processChunk.indexOf("\"is_wired\":true", idx)) != -1) {
-                    wiredCount++;
-                    idx += 15;
-                }
-                
-                idx = 0;
-                while ((idx = processChunk.indexOf("\"is_wired\":false", idx)) != -1) {
-                    wirelessCount++;
-                    idx += 16;
-                }
-                
-                // Keep last 200 chars for patterns that span chunks
-                searchBuffer = searchBuffer.substring(searchBuffer.length() - 200);
-                
-                Serial.println("Processed chunk. Current device count: " + String(deviceCount));
-            }
-            
-            // Watchdog delay every 20KB
-            if (totalBytesRead % 20480 == 0) {
-                delay(1);
-            }
-        }
-        
-        Serial.println("Total bytes read: " + String(totalBytesRead));
-        
-        // Process any remaining buffer
-        if (searchBuffer.length() > 0) {
-            int idx = 0;
-            while ((idx = searchBuffer.indexOf("\"mac\":\"", idx)) != -1) {
-                deviceCount++;
-                idx += 7;
-            }
-            
-            idx = 0;
-            while ((idx = searchBuffer.indexOf("\"is_wired\":true", idx)) != -1) {
-                wiredCount++;
-                idx += 15;
-            }
-            
-            idx = 0;
-            while ((idx = searchBuffer.indexOf("\"is_wired\":false", idx)) != -1) {
-                wirelessCount++;
-                idx += 16;
-            }
-        }
-        
-        delete[] chunk;  // Free heap memory
-        
-        Serial.println("*** DEVICE BREAKDOWN ***");
-        Serial.println("  Total MACs found: " + String(deviceCount));
-        Serial.println("  Wired: " + String(wiredCount));
-        Serial.println("  Wireless: " + String(wirelessCount));
-        Serial.println("*** SETTING DEVICE COUNT TO: " + String(deviceCount) + " ***");
-        
-        stats.connected_devices = deviceCount;
-        stats.wired_devices = wiredCount;
-        stats.wireless_devices = wirelessCount;
-    } else {
-        Serial.println("Client API HTTP error: " + String(httpCode));
-        if (httpCode == 401) {
-            Serial.println("Authentication failed - need to re-authenticate");
-            // Try to re-authenticate
-            if (authenticate()) {
-                Serial.println("Re-authenticated successfully, retrying...");
-                // Retry the request once
-                https.end();
-                return getClientStats(stats);
-            }
-        }
-    }
-    
-    https.end();
-}
-
-// Get system statistics
-void UniFiAPI::getSystemStats(NetworkStats& stats) {
-    HTTPClient https;
-    String sysinfoUrl = baseUrl + UNIFI_API_SYSINFO;
-    
-    #if DEBUG_API
-    Serial.println("Fetching system stats from: " + sysinfoUrl);
-    #endif
-    
-    if (!https.begin(client, sysinfoUrl)) {
-        return;
-    }
-    
-    // Always add authentication headers
-    if (!sessionCookie.isEmpty()) {
-        https.addHeader("Cookie", sessionCookie);
-    }
-    if (!csrfToken.isEmpty()) {
-        https.addHeader("X-Csrf-Token", csrfToken);
-    }
-    #if DEBUG_API
-    if (!sessionCookie.isEmpty()) {
-        Serial.println("Using auth cookie: " + sessionCookie.substring(0, 40) + "...");
-    }
-    #endif
-    
-    int httpCode = https.GET();
-    
     if (httpCode == HTTP_CODE_OK) {
         String response = https.getString();
         
         JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, response);
-        
-        if (!error && doc["meta"]["rc"] == "ok") {
-            JsonArray data = doc["data"];
+        if (!deserializeJson(doc, response) && doc["meta"]["rc"] == "ok") {
+            int wanClients = -1;
+            int lanUsers = 0;
+            int wlanUsers = 0;
             
-            if (data.size() > 0) {
-                JsonObject sysinfo = data[0];
+            for (JsonObject h : doc["data"].as<JsonArray>()) {
+                String subsystem = h["subsystem"] | "";
                 
-                stats.wan_ip = sysinfo["wan_ip"] | "";
-                stats.uptime_seconds = sysinfo["uptime"] | 0;
-                
-                #if DEBUG_API
-                Serial.println("System info:");
-                Serial.println("  WAN IP: " + stats.wan_ip);
-                Serial.println("  Uptime: " + String(stats.uptime_seconds) + " seconds");
-                #endif
+                if (subsystem == "wan") {
+                    // rx_bytes-r and tx_bytes-r are bytes per second
+                    stats.download_mbps = (h["rx_bytes-r"] | 0.0f) * 8.0f / 1000000.0f;
+                    stats.upload_mbps = (h["tx_bytes-r"] | 0.0f) * 8.0f / 1000000.0f;
+                    stats.wan_status = h["status"] | "UNKNOWN";
+                    stats.wan_ip = h["wan_ip"] | "";
+                    stats.gateway_name = h["gw_name"] | "";
+                    stats.isp_name = h["isp_name"] | "";
+                    
+                    // Latency and availability from uptime_stats
+                    JsonObject wan = h["uptime_stats"]["WAN"];
+                    if (!wan.isNull()) {
+                        stats.ping_ms = wan["latency_average"] | 0.0f;
+                        stats.uptime_percent = wan["availability"] | 0.0f;
+                    }
+                    
+                    // The UDM reports these as strings ("28.2"), so parse either form
+                    JsonObject gw = h["gw_system-stats"];
+                    if (!gw.isNull()) {
+                        stats.gateway_cpu = gw["cpu"].is<const char*>() ? atof(gw["cpu"]) : (gw["cpu"] | -1.0f);
+                        stats.gateway_mem = gw["mem"].is<const char*>() ? atof(gw["mem"]) : (gw["mem"] | -1.0f);
+                    }
+                    
+                    if (!h["num_sta"].isNull()) {
+                        // Total of all clients on the site
+                        wanClients = h["num_sta"].as<int>();
+                    }
+                    stats.devices_offline += h["num_disconnected"] | 0;
+                } else if (subsystem == "lan") {
+                    lanUsers = (h["num_user"] | 0) + (h["num_guest"] | 0);
+                    stats.devices_offline += h["num_disconnected"] | 0;
+                } else if (subsystem == "wlan") {
+                    wlanUsers = (h["num_user"] | 0) + (h["num_guest"] | 0);
+                    stats.devices_offline += h["num_disconnected"] | 0;
+                } else if (subsystem == "www") {
+                    stats.www_status = h["status"] | "";
+                }
             }
-        }
-    }
-    
-    https.end();
-}
+            stats.health_ok = true;
 
-// Get network experience score from client and device satisfaction
-void UniFiAPI::getNetworkExperience(NetworkStats& stats) {
-    HTTPClient https;
-    String clientsUrl = baseUrl + "/proxy/network/api/s/default/stat/sta";
-    
-    #if DEBUG_API
-    Serial.println("Fetching network experience from clients: " + clientsUrl);
-    #endif
-    
-    if (!https.begin(client, clientsUrl)) {
-        return;
-    }
-    
-    // Add authentication headers
-    if (!sessionCookie.isEmpty()) {
-        https.addHeader("Cookie", sessionCookie);
-    }
-    if (!csrfToken.isEmpty()) {
-        https.addHeader("X-Csrf-Token", csrfToken);
-    }
-    
-    int httpCode = https.GET();
-    
-    if (httpCode == HTTP_CODE_OK) {
-        String response = https.getString();
-        
-        DynamicJsonDocument doc(32768);  // 32KB for client data
-        DeserializationError error = deserializeJson(doc, response);
-        
-        if (!error && doc["meta"]["rc"] == "ok") {
-            JsonArray clients = doc["data"];
-            
-            float totalSatisfaction = 0;
-            int satisfactionCount = 0;
-            
-            // Calculate average client satisfaction
-            for (JsonObject client : clients) {
-                if (client["satisfaction"]) {
-                    float satisfaction = client["satisfaction"].as<float>();
-                    if (satisfaction >= 0) {  // Valid satisfaction score
-                        totalSatisfaction += satisfaction;
-                        satisfactionCount++;
-                    }
-                }
-            }
-            
-            if (satisfactionCount > 0) {
-                stats.experience_score = totalSatisfaction / satisfactionCount;
-                stats.data_source = "Experience";
-                
-                #if DEBUG_API
-                Serial.printf("Client Experience: %.1f%% (from %d clients)\n", stats.experience_score, satisfactionCount);
-                #endif
-            } else {
-                // Calculate a reasonable experience score based on network health
-                float healthScore = 0;
-                if (stats.ping_ms > 0 && stats.ping_ms < 50) {
-                    healthScore += 40; // Good ping
-                } else if (stats.ping_ms < 100) {
-                    healthScore += 20; // OK ping
-                }
-                
-                if (stats.uptime_percent > 99) {
-                    healthScore += 40; // Excellent uptime
-                } else if (stats.uptime_percent > 95) {
-                    healthScore += 30; // Good uptime
-                }
-                
-                if (stats.connected_devices > 0) {
-                    healthScore += 20; // Devices connected
-                }
-                
-                stats.experience_score = healthScore;
-                stats.data_source = "Calculated";
-                
-                #if DEBUG_API
-                Serial.printf("Calculated experience: %.1f%% (ping: %.1f, uptime: %.1f%%)\n", 
-                             stats.experience_score, stats.ping_ms, stats.uptime_percent);
-                #endif
-            }
-        }
-    }
-    
-    https.end();
-    
-    // If we didn't get client satisfaction, try device satisfaction
-    if (stats.experience_score == 0) {
-        String devicesUrl = baseUrl + UNIFI_API_DEVICES;
-        
-        if (https.begin(client, devicesUrl)) {
-            if (!sessionCookie.isEmpty()) {
-                https.addHeader("Cookie", sessionCookie);
-            }
-            if (!csrfToken.isEmpty()) {
-                https.addHeader("X-Csrf-Token", csrfToken);
-            }
-            
-            httpCode = https.GET();
-            
-            if (httpCode == HTTP_CODE_OK) {
-                String response = https.getString();
-                
-                DynamicJsonDocument doc(16384);  // 16KB for device data
-                DeserializationError error = deserializeJson(doc, response);
-                
-                if (!error && doc["meta"]["rc"] == "ok") {
-                    JsonArray devices = doc["data"];
-                    
-                    float totalSatisfaction = 0;
-                    int satisfactionCount = 0;
-                    
-                    for (JsonObject device : devices) {
-                        if (device["satisfaction"]) {
-                            float satisfaction = device["satisfaction"].as<float>();
-                            if (satisfaction >= 0) {  // Valid satisfaction score
-                                totalSatisfaction += satisfaction;
-                                satisfactionCount++;
-                            }
-                        }
-                    }
-                    
-                    if (satisfactionCount > 0) {
-                        stats.experience_score = totalSatisfaction / satisfactionCount;
-                        stats.data_source = "Experience";
-                        
-                        #if DEBUG_API
-                        Serial.printf("Device Experience: %.1f%% (from %d devices)\n", stats.experience_score, satisfactionCount);
-                        #endif
-                    }
-                }
-            }
-            
-            https.end();
-        }
-    }
-}
-
-// Get device statistics (gateway, switches, APs)
-void UniFiAPI::getDeviceStats(NetworkStats& stats) {
-    HTTPClient https;
-    String devicesUrl = baseUrl + UNIFI_API_DEVICES;
-    
-    #if DEBUG_API
-    Serial.println("Fetching device stats from: " + devicesUrl);
-    #endif
-    
-    if (!https.begin(client, devicesUrl)) {
-        return;
-    }
-    
-    // Always add authentication headers
-    if (!sessionCookie.isEmpty()) {
-        https.addHeader("Cookie", sessionCookie);
-    }
-    if (!csrfToken.isEmpty()) {
-        https.addHeader("X-Csrf-Token", csrfToken);
-    }
-    #if DEBUG_API
-    if (!sessionCookie.isEmpty()) {
-        Serial.println("Using auth cookie: " + sessionCookie.substring(0, 40) + "...");
-    }
-    #endif
-    
-    int httpCode = https.GET();
-    
-    if (httpCode == HTTP_CODE_OK) {
-        String response = https.getString();
-        
-        #if DEBUG_API
-        Serial.println("Devices response length: " + String(response.length()));
-        if (response.length() < 2000) {
-            Serial.println("Full device response: " + response);
-        }
-        #endif
-        
-        // Use larger buffer for device stats too
-        DynamicJsonDocument doc(65536);
-        DeserializationError error = deserializeJson(doc, response);
-        
-        if (!error && doc["meta"]["rc"] == "ok") {
-            JsonArray devices = doc["data"];
+            stats.connected_devices = wanClients >= 0 ? wanClients : lanUsers + wlanUsers;
+            stats.wired_devices = lanUsers;
+            stats.wireless_devices = wlanUsers;
             
             #if DEBUG_API
-            Serial.println("Found " + String(devices.size()) + " devices");
+            Serial.printf("  Health: %.2f/%.2f Mbps, %.0f ms, %.1f%% up, WAN %s\n",
+                          stats.download_mbps, stats.upload_mbps, stats.ping_ms,
+                          stats.uptime_percent, stats.wan_status.c_str());
+            Serial.printf("  Clients: %d (wan num_sta %d, lan %d, wlan %d)\n",
+                          stats.connected_devices, wanClients, lanUsers, wlanUsers);
+            Serial.printf("  Status: www %s, %d devices offline\n",
+                          stats.www_status.c_str(), stats.devices_offline);
             #endif
-            
-            for (JsonObject device : devices) {
-                String type = device["type"] | "";
-                String name = device["name"] | "Unknown";
-                
-                #if DEBUG_API
-                Serial.println("Device: " + name + " (type: " + type + ")");
-                #endif
-                
-                // Look for gateway device (UDM, USG, etc)
-                if (type == "ugw" || type == "udm" || type == "usg" || name.indexOf("Dream Machine") >= 0) {
-                    // Try to get uplink stats
-                    if (device["uplink"]) {
-                        JsonObject uplink = device["uplink"];
-                        
-                        // Look for speed fields
-                        if (uplink["speed"]) {
-                            int speed = uplink["speed"];
-                            #if DEBUG_API
-                            Serial.println("  Uplink speed: " + String(speed) + " Mbps");
-                            #endif
-                        }
-                        
-                        stats.ping_ms = uplink["latency"] | 0.0f;
-                        
-                        // Get throughput
-                        if (uplink["rx_bytes"]) {
-                            unsigned long rx = uplink["rx_bytes"];
-                            if (uplink["uptime"]) {
-                                int uptime = uplink["uptime"];
-                                if (uptime > 0) {
-                                    stats.download_mbps = (rx * 8.0) / (uptime * 1000000.0);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Get total bytes from device for monthly usage
-                    // Check for the 'bytes' field first (total)
-                    if (device["bytes"]) {
-                        unsigned long total = device["bytes"].as<unsigned long>();
-                        stats.total_bytes_month = total;
-                        stats.data_source = "Total";
-                        #if DEBUG_API
-                        Serial.printf("  Device total bytes: %lu (%.2f GB)\n", total, total / (1024.0*1024.0*1024.0));
-                        #endif
-                    } 
-                    // Otherwise use rx_bytes + tx_bytes
-                    else if (device["rx_bytes"] || device["tx_bytes"]) {
-                        unsigned long rx = device["rx_bytes"] | 0UL;
-                        unsigned long tx = device["tx_bytes"] | 0UL;
-                        stats.total_bytes_month = rx + tx;
-                        
-                        // Set label based on what data we have
-                        if (rx > 0 && tx > 0) {
-                            stats.data_source = "RX+TX";
-                        } else if (rx > 0) {
-                            stats.data_source = "RX";
-                        } else {
-                            stats.data_source = "TX";
-                        }
-                        
-                        #if DEBUG_API
-                        Serial.printf("  Device RX: %.2f GB, TX: %.2f GB, Total: %.2f GB\n", 
-                                     rx / (1024.0*1024.0*1024.0),
-                                     tx / (1024.0*1024.0*1024.0),
-                                     (rx + tx) / (1024.0*1024.0*1024.0));
-                        #endif
-                    }
-                    
-                    // Try port_table for more detailed stats
-                    if (device["port_table"]) {
-                        JsonArray ports = device["port_table"];
-                        for (JsonObject port : ports) {
-                            String port_name = port["name"] | "";
-                            if (port_name == "wan" || port_name == "eth4" || port_name == "eth0") {
-                                unsigned long rx_bytes = port["rx_bytes"] | 0;
-                                unsigned long tx_bytes = port["tx_bytes"] | 0;
-                                
-                                #if DEBUG_API
-                                Serial.println("  WAN port stats:");
-                                Serial.println("    RX bytes: " + String(rx_bytes));
-                                Serial.println("    TX bytes: " + String(tx_bytes));
-                                #endif
-                                
-                                // Calculate rate if we have uptime
-                                if (port["up"]) {
-                                    // Port is up, use recent rate if available
-                                    if (port["rx_rate"]) {
-                                        stats.download_mbps = (port["rx_rate"].as<float>() * 8.0) / 1000000.0;
-                                    }
-                                    if (port["tx_rate"]) {
-                                        stats.upload_mbps = (port["tx_rate"].as<float>() * 8.0) / 1000000.0;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Check if device is online
-                    int state = device["state"] | 0;
-                    stats.wan_status = (state == 1) ? "CONNECTED" : "DISCONNECTED";
-                    
-                    #if DEBUG_API
-                    Serial.println("  Gateway state: " + stats.wan_status);
-                    #endif
-                }
-            }
+        } else {
+            Serial.println("Health response could not be parsed");
         }
     } else {
-        #if DEBUG_API
-        Serial.println("Device API error: " + String(httpCode));
-        #endif
+        Serial.println("Health request failed. HTTP code: " + String(httpCode));
+        if (httpCode == 401) {
+            Serial.println("API key rejected - check UNIFI_API_KEY");
+            authenticated = false;  // isConnected() will re-check after API_RETRY_DELAY
+        }
     }
     
     https.end();
-    
-    // Try health endpoint as fallback
-    if (stats.download_mbps == 0 && stats.upload_mbps == 0) {
-        HTTPClient https2;
-        String healthUrl = baseUrl + UNIFI_API_HEALTH;
-        
-        if (https2.begin(client, healthUrl)) {
-            https2.addHeader("Cookie", sessionCookie);
-            if (!csrfToken.isEmpty()) {
-                https2.addHeader("X-CSRF-Token", csrfToken);
-            }
-            
-            int code = https2.GET();
-            if (code == HTTP_CODE_OK) {
-                String resp = https2.getString();
-                
-                #if DEBUG_API
-                Serial.println("Health endpoint checking for WAN stats...");
-                #endif
-                
-                // Parse health data for throughput
-                DynamicJsonDocument hdoc(16384);  // 16KB for health data
-                if (!deserializeJson(hdoc, resp) && hdoc["meta"]["rc"] == "ok") {
-                    JsonArray health = hdoc["data"];
-                    
-                    // First pass - look for overall site satisfaction/experience
-                    for (JsonObject h : health) {
-                        String subsystem = h["subsystem"] | "";
-                        
-                        // Check for overall site health/experience
-                        if (subsystem == "" || subsystem == "site") {
-                            if (h["satisfaction"]) {
-                                stats.experience_score = h["satisfaction"].as<float>();
-                                #if DEBUG_API
-                                Serial.println("  Site satisfaction: " + String(stats.experience_score));
-                                #endif
-                            }
-                        }
-                    }
-                    
-                    // Second pass - get specific subsystem data
-                    for (JsonObject h : health) {
-                        String subsystem = h["subsystem"] | "";
-                        
-                        if (subsystem == "wan") {
-                            // rx_bytes-r and tx_bytes-r are bytes per second
-                            if (h["rx_bytes-r"]) {
-                                float rx_bytes_per_sec = h["rx_bytes-r"].as<float>();
-                                stats.download_mbps = (rx_bytes_per_sec * 8.0) / 1000000.0;
-                                #if DEBUG_API
-                                Serial.printf("  WAN rx_bytes-r: %.0f bytes/sec = %.2f Mbps\n", rx_bytes_per_sec, stats.download_mbps);
-                                #endif
-                            }
-                            if (h["tx_bytes-r"]) {
-                                float tx_bytes_per_sec = h["tx_bytes-r"].as<float>();
-                                stats.upload_mbps = (tx_bytes_per_sec * 8.0) / 1000000.0;
-                                #if DEBUG_API
-                                Serial.printf("  WAN tx_bytes-r: %.0f bytes/sec = %.2f Mbps\n", tx_bytes_per_sec, stats.upload_mbps);
-                                #endif
-                            }
-                            
-                            stats.wan_status = h["status"] | "UNKNOWN";
-                            
-                            // Get latency and availability from uptime_stats
-                            if (h["uptime_stats"]) {
-                                JsonObject uptime_stats = h["uptime_stats"];
-                                if (uptime_stats["WAN"]) {
-                                    JsonObject wan = uptime_stats["WAN"];
-                                    if (wan["latency_average"]) {
-                                        stats.ping_ms = wan["latency_average"].as<float>();
-                                        #if DEBUG_API
-                                        Serial.println("  Got WAN latency from uptime_stats: " + String(stats.ping_ms) + " ms");
-                                        #endif
-                                    }
-                                    // Get WAN availability as uptime percentage
-                                    if (wan["availability"]) {
-                                        stats.uptime_percent = wan["availability"].as<float>();
-                                        #if DEBUG_API
-                                        Serial.println("  WAN availability: " + String(stats.uptime_percent) + "%");
-                                        #endif
-                                    }
-                                }
-                            }
-                            
-                            // Get experience score if available
-                            if (h["satisfaction"]) {
-                                stats.experience_score = h["satisfaction"].as<float>();
-                                #if DEBUG_API
-                                Serial.println("  Experience score: " + String(stats.experience_score));
-                                #endif
-                            }
-                            // Alternative field for experience
-                            else if (h["xp_score"]) {
-                                stats.experience_score = h["xp_score"].as<float>();
-                                #if DEBUG_API
-                                Serial.println("  XP score: " + String(stats.experience_score));
-                                #endif
-                            }
-                            
-                            // Get monthly data usage from WAN stats (keeping for potential use)
-                            if (h["wan-rx_bytes"]) {
-                                stats.total_bytes_month += h["wan-rx_bytes"].as<unsigned long>();
-                            }
-                            if (h["wan-tx_bytes"]) {
-                                stats.total_bytes_month += h["wan-tx_bytes"].as<unsigned long>();
-                            }
-                            
-                            #if DEBUG_API
-                            Serial.println("  WAN status: " + stats.wan_status);
-                            Serial.println("  WAN latency: " + String(stats.ping_ms) + " ms");
-                            if (stats.experience_score > 0) {
-                                Serial.println("  Experience: " + String(stats.experience_score) + "/100");
-                            }
-                            #endif
-                        }
-                        
-                        if (subsystem == "wlan") {
-                            int wlan_users = 0;
-                            if (h["num_sta"]) {
-                                wlan_users = h["num_sta"].as<int>();
-                            } else if (h["num_user"]) {
-                                wlan_users = h["num_user"].as<int>();
-                            }
-                            
-                            if (wlan_users > 0) {
-                                // Add WLAN users to total if we haven't counted clients yet
-                                if (stats.connected_devices == 0 || stats.connected_devices < wlan_users) {
-                                    stats.connected_devices = wlan_users;
-                                }
-                                #if DEBUG_API
-                                Serial.println("  WLAN users: " + String(wlan_users));
-                                #endif
-                            }
-                        }
-                    }
-                }
-            }
-            https2.end();
-        }
-    }
 }
 
-int UniFiAPI::getActiveClients() {
-    if (!isConnected()) {
-        return 0;
-    }
-    
+// WAN download/upload totals for the current period of a daily or monthly site report
+void UniFiAPI::fetchUsageReport(const char* path, UsageTotals& usage) {
     HTTPClient https;
-    String clientsUrl = baseUrl + UNIFI_API_CLIENTS;
+    String reportUrl = baseUrl + path;
     
-    if (!https.begin(client, clientsUrl)) {
-        return 0;
+    if (!beginRequest(https, reportUrl)) {
+        Serial.println("Failed to begin HTTPS for usage report " + String(path));
+        return;
     }
+    https.addHeader("Content-Type", "application/json");
     
-    // Always add authentication headers
-    if (!sessionCookie.isEmpty()) {
-        https.addHeader("Cookie", sessionCookie);
-    }
-    if (!csrfToken.isEmpty()) {
-        https.addHeader("X-Csrf-Token", csrfToken);
-    }
-    #if DEBUG_API
-    if (!sessionCookie.isEmpty()) {
-        Serial.println("Using auth cookie: " + sessionCookie.substring(0, 40) + "...");
-    }
-    #endif
-    
-    int httpCode = https.GET();
-    int clientCount = 0;
-    
+    // With no start/end, the controller returns recent periods ending with the current one
+    int httpCode = https.POST("{\"attrs\":[\"wan-rx_bytes\",\"wan-tx_bytes\",\"time\"]}");
     if (httpCode == HTTP_CODE_OK) {
         String response = https.getString();
         
         JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, response);
-        
-        if (!error && doc["meta"]["rc"] == "ok") {
-            JsonArray data = doc["data"];
-            clientCount = data.size();
+        if (!deserializeJson(doc, response) && doc["meta"]["rc"] == "ok") {
+            // The newest entry is the current day or month
+            double latestTime = -1;
+            for (JsonObject r : doc["data"].as<JsonArray>()) {
+                double t = r["time"] | 0.0;
+                if (t > latestTime) {
+                    latestTime = t;
+                    // Byte counts arrive as doubles and exceed 32 bits
+                    usage.rx_bytes = (uint64_t)(r["wan-rx_bytes"] | 0.0);
+                    usage.tx_bytes = (uint64_t)(r["wan-tx_bytes"] | 0.0);
+                    usage.valid = true;
+                }
+            }
+            
+            #if DEBUG_API
+            Serial.printf("  Usage %s: %.1f GB down, %.1f GB up\n",
+                          path, usage.rx_bytes / 1e9, usage.tx_bytes / 1e9);
+            #endif
         }
+    } else {
+        Serial.println("Usage report request failed. HTTP code: " + String(httpCode));
     }
     
     https.end();
-    return clientCount;
 }
 
-String UniFiAPI::extractCookie(String headers) {
-    // UDM uses TOKEN cookie
-    int tokenStart = headers.indexOf("TOKEN=");
-    if (tokenStart != -1) {
-        int tokenEnd = headers.indexOf(";", tokenStart);
-        if (tokenEnd == -1) {
-            tokenEnd = headers.length();
+// Count site-to-site VPN tunnels that aren't connected; leaves vpnDown at -1 if the request fails
+void UniFiAPI::fetchVpnStatus() {
+    HTTPClient https;
+    String vpnUrl = baseUrl + UNIFI_API_VPN;
+
+    if (!beginRequest(https, vpnUrl)) {
+        Serial.println("Failed to begin HTTPS for VPN status");
+        return;
+    }
+
+    int httpCode = https.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String response = https.getString();
+
+        // v2 responses have no meta/rc wrapper: {"connections":[{"status":"CONNECTED",...}]}
+        JsonDocument doc;
+        if (!deserializeJson(doc, response)) {
+            int total = 0;
+            int down = 0;
+            for (JsonObject conn : doc["connections"].as<JsonArray>()) {
+                total++;
+                String status = conn["status"] | "";
+                if (status != "CONNECTED") {
+                    down++;
+                }
+            }
+            vpnDown = down;
+
+            #if DEBUG_API
+            Serial.printf("  VPN: %d of %d tunnels connected\n", total - down, total);
+            #endif
+        } else {
+            Serial.println("VPN status response could not be parsed");
         }
-        return headers.substring(tokenStart, tokenEnd);
+    } else {
+        Serial.println("VPN status request failed. HTTP code: " + String(httpCode));
+        vpnDown = -1;
     }
-    
-    // Some versions use unifises
-    int sesStart = headers.indexOf("unifises=");
-    if (sesStart != -1) {
-        int sesEnd = headers.indexOf(";", sesStart);
-        if (sesEnd == -1) {
-            sesEnd = headers.length();
-        }
-        return headers.substring(sesStart, sesEnd);
-    }
-    
-    // Try to get any cookie that looks like a session
-    if (headers.indexOf("=") != -1) {
-        // Just return the whole cookie string for now
-        int end = headers.indexOf(";");
-        if (end == -1) end = headers.length();
-        return headers.substring(0, end);
-    }
-    
-    return "";
+
+    https.end();
 }
 
-String UniFiAPI::extractCSRF(String headers) {
-    int csrfStart = headers.indexOf("X-CSRF-Token:");
-    if (csrfStart != -1) {
-        csrfStart += 14;  // Length of "X-CSRF-Token: "
-        int csrfEnd = headers.indexOf("\r", csrfStart);
-        if (csrfEnd != -1) {
-            return headers.substring(csrfStart, csrfEnd);
-        }
+// Devices tab order: gateway first, then switches, APs, everything else
+static int deviceTypeRank(const String& type) {
+    if (type == "udm" || type == "ugw" || type == "uxg") return 0;
+    if (type == "usw") return 1;
+    if (type == "uap") return 2;
+    return 3;
+}
+
+int UniFiAPI::getDevices(UniFiDevice* devices, int maxDevices) {
+    if (!isConnected()) {
+        return -1;
     }
-    return "";
+
+    HTTPClient https;
+    String devicesUrl = baseUrl + UNIFI_API_DEVICES;
+
+    // The body is read straight off the socket, so ask for HTTP/1.0 to avoid chunked encoding
+    https.useHTTP10(true);
+    if (!beginRequest(https, devicesUrl)) {
+        Serial.println("Failed to begin HTTPS for device list");
+        return -1;
+    }
+
+    unsigned long start = millis();
+    int httpCode = https.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        Serial.println("Device list request failed. HTTP code: " + String(httpCode));
+        if (httpCode == 401) {
+            authenticated = false;  // isConnected() will re-check after API_RETRY_DELAY
+        }
+        https.end();
+        return -1;
+    }
+
+    // Parse as the response streams in, keeping only these fields of each device
+    JsonDocument filter;
+    JsonObject fields = filter["network_devices"][0].to<JsonObject>();
+    fields["name"] = true;
+    fields["model"] = true;
+    fields["type"] = true;
+    fields["state"] = true;
+    fields["num_sta"] = true;
+    JsonObject portFields = fields["port_table"][0].to<JsonObject>();
+    portFields["up"] = true;
+    portFields["speed"] = true;
+    portFields["is_uplink"] = true;
+
+    // Buffer reads so the parser isn't pulling one byte at a time through TLS
+    ReadBufferingStream stream(https.getStream(), 1024);
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, stream, DeserializationOption::Filter(filter));
+    https.end();
+
+    if (error) {
+        Serial.println("Device list could not be parsed: " + String(error.c_str()));
+        return -1;
+    }
+
+    int total = 0;
+    for (JsonObject d : doc["network_devices"].as<JsonArray>()) {
+        if (total < maxDevices) {
+            UniFiDevice& dev = devices[total];
+            dev.model = d["model"] | "";
+            dev.name = d["name"] | "";
+            if (dev.name.isEmpty()) {
+                dev.name = dev.model;  // Unnamed devices show their model
+            }
+            dev.type = d["type"] | "";
+            dev.state = d["state"] | 0;
+            dev.num_sta = d["num_sta"] | 0;
+
+            dev.port_count = 0;
+            dev.port_up = 0;
+            dev.uplink_ports = 0;
+            for (JsonObject p : d["port_table"].as<JsonArray>()) {
+                bool up = p["up"] | false;
+                if (up) dev.port_up++;
+                if (dev.port_count < MAX_DEVICE_PORTS) {
+                    dev.port_speed[dev.port_count] = up ? (p["speed"] | 0) : 0;
+                    if (p["is_uplink"] | false) {
+                        dev.uplink_ports |= 1UL << dev.port_count;
+                    }
+                }
+                dev.port_count++;
+            }
+        }
+        total++;
+    }
+
+    // Insertion sort by type rank, then name
+    int count = min(total, maxDevices);
+    for (int i = 1; i < count; i++) {
+        UniFiDevice dev = devices[i];
+        int rank = deviceTypeRank(dev.type);
+        int j = i - 1;
+        while (j >= 0 && (deviceTypeRank(devices[j].type) > rank ||
+                          (deviceTypeRank(devices[j].type) == rank && devices[j].name.compareTo(dev.name) > 0))) {
+            devices[j + 1] = devices[j];
+            j--;
+        }
+        devices[j + 1] = dev;
+    }
+
+    #if DEBUG_API
+    Serial.printf("  Devices: %d loaded in %lu ms\n", total, millis() - start);
+    #endif
+    return total;
+}
+
+// Clients tab orderings for keepTop()
+static bool busier(const ClientInfo& a, const ClientInfo& b) {
+    return a.down_bps + a.up_bps > b.down_bps + b.up_bps;
+}
+static bool newer(const ClientInfo& a, const ClientInfo& b) { return a.uptime < b.uptime; }
+
+// Insert c into list, kept in before() order and capped at cap entries
+static void keepTop(ClientInfo* list, int& count, int cap, const ClientInfo& c,
+                    bool (*before)(const ClientInfo&, const ClientInfo&)) {
+    int pos = count;
+    while (pos > 0 && before(c, list[pos - 1])) {
+        pos--;
+    }
+    if (pos >= cap) {
+        return;
+    }
+    for (int i = min(count, cap - 1); i > pos; i--) {
+        list[i] = list[i - 1];
+    }
+    list[pos] = c;
+    if (count < cap) {
+        count++;
+    }
+}
+
+bool UniFiAPI::getClients(ClientSummary& summary) {
+    if (!isConnected()) {
+        return false;
+    }
+
+    HTTPClient https;
+    String clientsUrl = baseUrl + UNIFI_API_CLIENTS;
+
+    // The body is read straight off the socket, so ask for HTTP/1.0 to avoid chunked encoding
+    https.useHTTP10(true);
+    if (!beginRequest(https, clientsUrl)) {
+        Serial.println("Failed to begin HTTPS for client list");
+        return false;
+    }
+
+    unsigned long start = millis();
+    int httpCode = https.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        Serial.println("Client list request failed. HTTP code: " + String(httpCode));
+        if (httpCode == 401) {
+            authenticated = false;  // isConnected() will re-check after API_RETRY_DELAY
+        }
+        https.end();
+        return false;
+    }
+
+    // The response is a bare array of clients; keep only the fields the tab uses
+    JsonDocument filter;
+    JsonObject fields = filter[0].to<JsonObject>();
+    fields["name"] = true;
+    fields["hostname"] = true;
+    fields["mac"] = true;
+    fields["rx_bytes-r"] = true;
+    fields["tx_bytes-r"] = true;
+    fields["uptime"] = true;
+
+    // Buffer reads so the parser isn't pulling one byte at a time through TLS
+    ReadBufferingStream stream(https.getStream(), 1024);
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, stream, DeserializationOption::Filter(filter));
+    https.end();
+
+    if (error) {
+        Serial.println("Client list could not be parsed: " + String(error.c_str()));
+        return false;
+    }
+
+    ClientSummary s = ClientSummary();  // Value-initialized, so every count starts at 0
+    for (JsonObject c : doc.as<JsonArray>()) {
+        s.total++;
+
+        ClientInfo info;
+        // display_name adds MAC bytes to unnamed clients ("Macmini f9:b2"), so build the name here.
+        // With no name or hostname, the full MAC lets you look the client up in the UniFi app
+        info.name = c["name"] | "";
+        if (info.name.isEmpty()) info.name = c["hostname"] | "";
+        if (info.name.isEmpty()) info.name = c["mac"] | "";
+        // Rates are from the network's side: tx is sent to the client, rx is received from it
+        info.down_bps = c["tx_bytes-r"] | 0.0f;
+        info.up_bps = c["rx_bytes-r"] | 0.0f;
+        info.uptime = c["uptime"] | 0UL;
+
+        if (info.down_bps + info.up_bps > 0) {
+            keepTop(s.top, s.top_count, TOP_CLIENTS, info, busier);
+        }
+        keepTop(s.newest, s.newest_count, NEWEST_CLIENTS, info, newer);
+    }
+
+    #if DEBUG_API
+    Serial.printf("  Clients: %d loaded in %lu ms\n", s.total, millis() - start);
+    #endif
+    summary = s;
+    return true;
 }
 
 void UniFiAPI::setInsecure(bool insecure) {
